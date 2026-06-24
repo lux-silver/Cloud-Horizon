@@ -8,7 +8,7 @@
 
 local PROTOCOL    = "cloud_ui"
 -- SERVER_URL é dinâmico — verificado a cada 60s via GitHub ou URL cacheada
-local URL_SRC    = "https://raw.githubusercontent.com/Oorange2/cc-player-radar/main/tunnel_url.txt"
+local URL_SRC    = "https://raw.githubusercontent.com/lux-silver/Cloud-Horizon/main/tunnel_url.txt"
 local URL_CACHE  = "/.bridge_url"
 local SERVER_URL = ""  -- preenchido no boot por loadServerUrl()
 
