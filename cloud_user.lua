@@ -1,7 +1,7 @@
 -- Cloud User v6
 local PROTOCOL = "cloud_ui"
 -- API_URL é dinâmica — buscada do GitHub no boot e refreshada a cada 5min
-local URL_SRC    = "https://raw.githubusercontent.com/Oorange2/cc-player-radar/main/tunnel_url.txt"
+local URL_SRC    = "https://raw.githubusercontent.com/lux-silver/Cloud-Horizon/main/tunnel_url.txt"
 local URL_CACHE  = "/.cloud_api_url"
 local API_URL    = ""
 
