@@ -7,7 +7,37 @@
 --   5. cfgCache TTL aumentado para 600s (era 300s)
 
 local PROTOCOL    = "cloud_ui"
-local SERVER_URL  = "https://ware-mere-entrance-saturn.trycloudflare.com"
+-- SERVER_URL é dinâmico — verificado a cada 60s via GitHub ou URL cacheada
+local URL_SRC    = "https://raw.githubusercontent.com/Oorange2/cc-player-radar/main/tunnel_url.txt"
+local URL_CACHE  = "/.bridge_url"
+local SERVER_URL = ""  -- preenchido no boot por loadServerUrl()
+
+local function loadServerUrl()
+    -- 1. Tenta GitHub (fonte de verdade)
+    local ok, res = pcall(http.get, URL_SRC)
+    if ok and res then
+        local u = res.readAll():gsub("%s+",""); res.close()
+        if u and #u > 10 then
+            SERVER_URL = u
+            local f = fs.open(URL_CACHE,"w"); f.write(u); f.close()
+            return true
+        end
+    end
+    -- 2. Fallback: cache local
+    if fs.exists(URL_CACHE) then
+        local f = fs.open(URL_CACHE,"r")
+        local u = f.readAll():gsub("%s+",""); f.close()
+        if u and #u > 10 then SERVER_URL = u; return true end
+    end
+    return false
+end
+
+-- Carrega URL no boot
+if not loadServerUrl() then
+    print("ERRO: Não foi possível obter SERVER_URL")
+    print("Coloque a URL em "..URL_CACHE.." e reinicie")
+    error("No server URL", 0)
+end
 local API_KEY     = "4bcd38c0c1797434951991004ef5474a"
 local BRIDGE_KEY  = "f7c14de40d2da4e12ed1b4334f8b2425"
 
@@ -159,6 +189,21 @@ end
 local function completeBridgeOp(id, phyOk, result)
     return brgPost("/bridge/complete", {id=id, ok=phyOk, result=result})
 end
+
+-- ── Monitor event emitter ─────────────────────────────────────────────────────
+-- Definido cedo para estar disponível em todos os loops abaixo.
+local MON_PROTO = "cloud_monitor"
+local MON_ID    = nil  -- nil = usa os.queueEvent local; number = envia via rednet
+
+local function monEmit(data)
+    pcall(os.queueEvent, "cloud_monitor", data)
+    if MON_ID then pcall(rednet.send, MON_ID, data, MON_PROTO) end
+end
+
+local function monLog(level, msg)
+    monEmit({type="log", level=level, msg=msg})
+end
+
 
 -- ── Reply helper ──────────────────────────────────────────────────────────────
 local function reply(cid, data, seq)
@@ -675,42 +720,130 @@ end
 local queue = {}        -- { cid, msg }
 local MAX_WORKERS = 4   -- no máximo 4 requests HTTP simultâneos
 
+-- Per-cid lock: prevents two workers handling the same tablet simultaneously,
+-- which would cause interleaved responses and seq desync.
+local cidLock     = {}   -- [cid] = true quando worker está processando
+local cidQueuedAt = {}   -- [cid+seq] = os.clock() quando entrou na fila
+
 local function workerLoop()
     while true do
         if #queue > 0 then
-            local item = table.remove(queue, 1)
-            local ok, err = pcall(handle, item.cid, item.msg)
-            if not ok then
-                print("[WORKER] Erro em "..tostring(item.msg.type)..": "..tostring(err))
-                rednet.send(item.cid, {ok=false, err="Internal error", _seq=item.msg._seq}, PROTOCOL)
+            local item, itemIdx = nil, nil
+            for i, q in ipairs(queue) do
+                if not cidLock[q.cid] then
+                    item = q; itemIdx = i; break
+                end
+            end
+
+            if item then
+                table.remove(queue, itemIdx)
+                local qkey = tostring(item.cid)..":"..tostring(item.msg._seq or 0)
+                cidQueuedAt[qkey] = nil
+                cidLock[item.cid] = true
+                monEmit({type="op_start", cid=item.cid, queue_size=#queue, op_type=item.msg.type or "?"})
+                local ok, err = pcall(handle, item.cid, item.msg)
+                cidLock[item.cid] = nil
+                local uname = type(item.msg)=="table" and item.msg._uname or nil
+                monEmit({type="op_done", cid=item.cid, queue_size=#queue,
+                         op_type=item.msg.type or "?", uname=uname, ok=ok})
+                if not ok then
+                    print("[WORKER] Erro em "..tostring(item.msg.type)..": "..tostring(err))
+                    monLog("err", "Worker: "..tostring(item.msg.type).." — "..tostring(err))
+                    rednet.send(item.cid, {ok=false, err="Internal error", _seq=item.msg._seq}, PROTOCOL)
+                end
+            else
+                -- Todos os items na fila estão bloqueados pelo cidLock.
+                -- Verifica se algum esperou demais (>4s) — manda busy e remove.
+                local now = os.clock()
+                local i = 1
+                while i <= #queue do
+                    local q = queue[i]
+                    local qkey = tostring(q.cid)..":"..tostring(q.msg._seq or 0)
+                    if not cidQueuedAt[qkey] then
+                        cidQueuedAt[qkey] = now
+                    elseif now - cidQueuedAt[qkey] > 4 then
+                        table.remove(queue, i)
+                        cidQueuedAt[qkey] = nil
+                        rednet.send(q.cid, {ok=false, err="Bridge busy", _seq=q.msg._seq}, PROTOCOL)
+                        monLog("warn", "Dropped stale queued op for cid "..tostring(q.cid))
+                    else
+                        i = i + 1
+                    end
+                end
+                sleep(0.05)
             end
         else
-            sleep(0.05) -- yield sem trabalho
+            sleep(0.05)
         end
     end
 end
 
+-- Per-cid flood control: max 3 pending items per tablet
 local function receiveLoop()
     while true do
         local cid, msg = rednet.receive(PROTOCOL, 30)
         if type(msg) == "table" then
-            if #queue < 32 then  -- proteção contra flood
+            -- Count pending items for this cid
+            local cidCount = 0
+            for _, q in ipairs(queue) do
+                if q.cid == cid then cidCount = cidCount + 1 end
+            end
+            if cidCount >= 3 then
+                -- Tablet is spamming — drop with busy signal
+                -- Only send busy if this is a newer seq than what's queued
+                rednet.send(cid, {ok=false, err="Bridge busy", _seq=msg._seq}, PROTOCOL)
+            elseif #queue < 32 then
                 table.insert(queue, {cid=cid, msg=msg})
+                monEmit({type="queue_update", size=#queue})
+                -- Register queue entry time for stale detection
+                local _qkey = tostring(cid)..":"..tostring(msg._seq or 0)
+                cidQueuedAt[_qkey] = os.clock()
             else
-                print("[BRIDGE] Fila cheia, descartando request de "..tostring(cid))
-                rednet.send(cid, {ok=false, err="Bridge busy"}, PROTOCOL)
+                print("[BRIDGE] Fila global cheia, descartando de "..tostring(cid))
+                monLog("warn", "Queue full, dropped from "..tostring(cid))
+                rednet.send(cid, {ok=false, err="Bridge busy", _seq=msg._seq}, PROTOCOL)
             end
         end
     end
 end
 
--- Periodic: busca bridge_ops pendentes no servidor (recuperação após tunnel cair)
+-- Periodic: busca bridge_ops pendentes + verifica se URL mudou
+local _pingCounter = 0
 local function pendingLoop()
     while true do
         sleep(15) -- a cada 15s
+        _pingCounter = _pingCounter + 1
+
+        -- Verifica URL a cada 60s (4 × 15s)
+        if _pingCounter % 4 == 0 then
+            local oldUrl = SERVER_URL
+            loadServerUrl()
+            if SERVER_URL ~= oldUrl and SERVER_URL ~= "" then
+                print("[URL] Tunnel mudou: "..SERVER_URL)
+                monLog("warn", "Tunnel URL atualizada: "..SERVER_URL)
+                monEmit({type="init", version="v3.1", server_url=SERVER_URL,
+                         peripherals=_periph_list or {}})
+            end
+
+            -- Ping com a URL atual
+            local pr = brgGet("/bridge/pending")
+            local pingOk = pr ~= nil
+            monEmit({type="server_ping", ok=pingOk})
+            if not pingOk then
+                monLog("warn", "Server não respondeu — tentando URL do GitHub...")
+                -- Força refresh da URL mesmo fora do ciclo normal
+                local prevUrl = SERVER_URL
+                loadServerUrl()
+                if SERVER_URL ~= prevUrl then
+                    print("[URL] Reconectando para "..SERVER_URL)
+                    monLog("ok", "Reconectado: "..SERVER_URL)
+                end
+            end
+        end
         local r = brgGet("/bridge/pending")
         if r and r.ok and r.ops and #r.ops > 0 then
             print("[PENDING] "..#r.ops.." op(s) para reprocessar")
+            monLog("warn", "Recovered "..#r.ops.." stale op(s)")
             for _, op in ipairs(r.ops) do
                 local payload = textutils.unserialiseJSON(op.payload or "{}")
                 payload._pending_op_id = op.id
@@ -724,9 +857,32 @@ local function pendingLoop()
 end
 
 -- Inicia tudo em paralelo
+
 print("Bridge v3.1 — parallel mode")
 print("Server: "..SERVER_URL)
-print("Periféricos: "..table.concat(peripheral.getNames(), ", "))
+local _periph_names = peripheral.getNames()
+print("Periféricos: "..table.concat(_periph_names, ", "))
+
+-- Build peripheral list for monitor
+local _periph_list = {}
+local _KNOWN_ROLES = {
+    [BANK_VAULT]="bank_vault",
+}
+for _, mv in ipairs(MARKET_VAULTS) do _KNOWN_ROLES[mv]="market_vault" end
+_KNOWN_ROLES[FOOD_VAULT] = "food_vault"
+for _, pname in ipairs(_periph_names) do
+    table.insert(_periph_list, {
+        name  = pname,
+        ptype = peripheral.getType(pname) or "?",
+        role  = _KNOWN_ROLES[pname],
+    })
+end
+monEmit({
+    type         = "init",
+    version      = "v3.1",
+    server_url   = SERVER_URL,
+    peripherals  = _periph_list,
+})
 
 -- Monta lista de coroutines: receive + pending + N workers
 local tasks = {receiveLoop, pendingLoop}
