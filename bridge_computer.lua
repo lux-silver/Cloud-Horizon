@@ -118,7 +118,7 @@ end
 local function getCfg(uname)
     local now = os.epoch("utc") / 1000
     local c = cfgCache[uname]
-    if c and (now - c.ts) < 600 then return c.cfg end
+    if c and (now - c.ts) < 120 then return c.cfg end
     local r = brgGet("/bridge/user_config?username="..uname)
     if r and r.ok then cfgCache[uname] = {cfg=r, ts=now}; return r end
     return nil
@@ -286,6 +286,11 @@ local function handle(cid, msg)
         -- Cache token→uname if server returned it
         if r and r._uname and msg.token then
             cacheToken(msg.token, r._uname)
+        end
+        -- Invalidate cfgCache when vault/invmgr changes
+        if (t == "admin_set_vault" or t == "admin_set_invmgr" or
+            t == "admin_update_user") and msg.username then
+            cfgCache[msg.username] = nil
         end
         reply(cid, r or {ok=false, err="Server error"}, seq)
         return
