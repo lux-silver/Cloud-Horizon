@@ -233,8 +233,12 @@ local function drawOps()
     if opsScroll > maxScroll then opsScroll = maxScroll end
 
     -- Column header
+    -- Dynamic column widths based on terminal width
+    local typeW = math.max(16, W - 28)
+    local unameW = 10
     term.setCursorPos(1, 3) clr(colors.gray, colors.black) term.clearLine()
-    term.write(" OK  Type           User       Time")
+    local hdr = " OK  " .. "Type" .. string.rep(" ", typeW-4) .. "User       Time"
+    term.write(hdr:sub(1, W))
 
     for row = 1, listH do
         local idx = #state.op_log - (row-1) - opsScroll  -- newest first
@@ -247,11 +251,11 @@ local function drawOps()
             clr(colors.black, op.ok and colors.lime or colors.red)
             term.write(op.ok and " ok " or " !! ")
             clr(colors.black, colors.white)
-            local typeFmt = op.type:sub(1,14)
-            term.write(typeFmt..string.rep(" ", 15-#typeFmt))
+            local typeFmt = op.type:sub(1, typeW)
+            term.write(typeFmt..string.rep(" ", typeW+1-#typeFmt))
             clr(colors.black, colors.cyan)
-            local unFmt = op.uname:sub(1,10)
-            term.write(unFmt..string.rep(" ", 11-#unFmt))
+            local unFmt = (op.uname or "?"):sub(1, unameW)
+            term.write(unFmt..string.rep(" ", unameW+1-#unFmt))
             clr(colors.black, colors.gray)
             term.write(fmtTs(op.ts))
         end
