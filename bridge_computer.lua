@@ -94,6 +94,27 @@ end
 
 -- ── Config cache (10 min TTL) ─────────────────────────────────────────────────
 local cfgCache = {}
+
+-- ── Token → username cache (for monitor display) ──────────────────────────────
+-- Populated when login is proxied through the bridge
+local tokenUnameCache = {}
+local function cacheToken(token, uname)
+    if token and uname then
+        tokenUnameCache[token] = uname
+        -- Limit cache size to 200 entries
+        local count = 0
+        for _ in pairs(tokenUnameCache) do count = count + 1 end
+        if count > 200 then
+            -- Remove oldest (arbitrary — just clear half)
+            local i = 0
+            for k in pairs(tokenUnameCache) do
+                tokenUnameCache[k] = nil
+                i = i + 1
+                if i > 100 then break end
+            end
+        end
+    end
+end
 local function getCfg(uname)
     local now = os.epoch("utc") / 1000
     local c = cfgCache[uname]
@@ -242,6 +263,13 @@ local PROXY = {
     admin_create_user    = "/admin_create_user",
     admin_delete_user    = "/admin_delete_user",
     admin_bank_overview  = "/admin_bank_overview",
+    admin_set_vault      = "/admin_set_vault",
+    admin_set_invmgr     = "/admin_set_invmgr",
+    admin_update_user    = "/admin_update_user",
+    admin_get_user       = "/admin_get_user",
+    admin_adjust_balance = "/admin_adjust_balance",
+    admin_forgive_loan   = "/admin_forgive_loan",
+    admin_bank_health    = "/admin_bank_health",
     subscription_food_items = "/subscription_food_items",
     subscription_status     = "/subscription_status",
     subscription_create     = "/subscription_create",
@@ -255,6 +283,10 @@ local function handle(cid, msg)
     -- ── Pure proxy ─────────────────────────────────────────────────────────────
     if PROXY[t] then
         local r = apiPost(PROXY[t], msg)
+        -- Cache token→uname if server returned it
+        if r and r._uname and msg.token then
+            cacheToken(msg.token, r._uname)
+        end
         reply(cid, r or {ok=false, err="Server error"}, seq)
         return
     end
@@ -308,6 +340,7 @@ local function handle(cid, msg)
 
         local sessR = brgPost("/get_session_uname", msg)
         local uname = sessR and sessR.uname
+        if uname and msg.token then cacheToken(msg.token, uname) end
         if not uname then reply(cid, {ok=false, err="Session error"}, seq); return end
         local isAdmin = sessR and sessR.isAdmin
 
@@ -740,10 +773,17 @@ local function workerLoop()
                 local qkey = tostring(item.cid)..":"..tostring(item.msg._seq or 0)
                 cidQueuedAt[qkey] = nil
                 cidLock[item.cid] = true
-                monEmit({type="op_start", cid=item.cid, queue_size=#queue, op_type=item.msg.type or "?"})
+                -- Resolve uname from token cache (populated on login)
+                local _monUname = "?"
+                if type(item.msg) == "table" and item.msg.token then
+                    _monUname = tokenUnameCache[item.msg.token] or "?"
+                end
+                monEmit({type="op_start", cid=item.cid, queue_size=#queue,
+                         op_type=item.msg.type or "?", uname=_monUname})
                 local ok, err = pcall(handle, item.cid, item.msg)
                 cidLock[item.cid] = nil
-                local uname = type(item.msg)=="table" and item.msg._uname or nil
+                -- After handle, _uname may have been set in msg by the handler
+                local uname = (type(item.msg)=="table" and item.msg._uname) or _monUname
                 monEmit({type="op_done", cid=item.cid, queue_size=#queue,
                          op_type=item.msg.type or "?", uname=uname, ok=ok})
                 if not ok then
